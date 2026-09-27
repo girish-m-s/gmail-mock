@@ -41,7 +41,7 @@ workers, without a Google account, OAuth, quotas or flaky network calls.
   - Google-shaped error JSON.
   - 401 without a bearer token.
   - 400 for unknown query parameters, unknown JSON fields, bad types or enums, and bad ids.
-  - `fields` partial responses and `prettyPrint`.
+  - `fields` partial responses and `prettyPrint=true`. Responses are compact JSON unless you ask for pretty output.
   - snake_case field aliases.
   - Multipart media uploads (`/upload/...`) and `/batch` requests.
 - **Test controls** under `/_mock`: simulate incoming mail, seed fixtures, inject faults (e.g. a 429 on
@@ -73,6 +73,7 @@ gmail-mock --email alice@example.com              # default mailbox for non-emai
 gmail-mock --push projects/p/topics/gmail=http://localhost:8080/push
 gmail-mock --pubsub-emulator-host localhost:8085  # also publish to the gcloud emulator
 gmail-mock --no-auth                              # don't require Authorization
+gmail-mock --history-limit 100000                 # history records kept per mailbox (older startHistoryId -> 404)
 ```
 
 ### Docker
@@ -239,11 +240,29 @@ endpoint listed there is implemented.
 
 </details>
 
+## Testing and performance
+
+The test suite has 521 tests and runs in about 40 seconds:
+
+| Layer | What it covers |
+| --- | --- |
+| Contract (`test_contract.py`) | One happy-path scenario for each of the 103 methods. Also generated for every method: 401 without auth, 400 for unknown query parameters, 400 for non-object or unknown-field bodies, and 404 for unknown ids |
+| Response schema | Every JSON response in every test is checked strictly against the discovery schema: unknown fields, types, int64-as-string, enums, base64 and timestamps. Error bodies must match Google's shape. Any 5xx fails the test |
+| Model-based (`test_model_based.py`) | Hypothesis generates random sequences of receive, send, modify, trash, untrash, delete, label and draft operations. After every step, lists, search, label counts, profile, history and drafts must match a reference model |
+| Behaviour | Messages, threads, drafts, labels, settings, People, both triggers, batch, uploads and faults, all tested through the official `google-api-python-client` |
+| Edge cases | RFC 2047 and unicode, LF-only and unpadded base64, malformed MIME, nested and forwarded mail, 10 MB attachments, paging limits, 60-message threads, and concurrent writers and notifications |
+
+[`stress/`](stress/README.md) has a load generator for throughput, mailbox scaling, soak, push, large-payload and
+correctness-under-load runs. On a laptop, the single-process server handles about **1.7k mixed req/s** with 0 errors,
+lists 50k-message mailboxes in about **0.5 ms**, and ran a 120 s soak (260k requests, 130k messages) with zero failures.
+See [stress/README.md](stress/README.md) for the numbers and the fixes they led to.
+
 ## Development
 
 ```bash
 uv sync            # install with dev dependencies
 make test          # pytest, driven by the official google-api-python-client
+make stress        # load / soak / scaling run (see stress/README.md)
 make lint          # ruff
 make run           # start with examples/seed.json
 make update-spec   # refresh the bundled discovery documents

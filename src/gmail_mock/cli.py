@@ -53,6 +53,9 @@ def _parser() -> argparse.ArgumentParser:
         help="also publish Gmail notifications to a Cloud Pub/Sub emulator",
     )
     p.add_argument("--no-auth", action="store_true", help="accept requests without an Authorization header")
+    p.add_argument(
+        "--history-limit", type=int, default=100_000, help="history records kept per mailbox; older startHistoryIds get 404 (0 = unlimited)"
+    )
     p.add_argument("--cert", help="TLS certificate for HTTPS (defaults to a generated self-signed one)")
     p.add_argument("--key", help="TLS private key for HTTPS")
     p.add_argument("--log-level", default="info")
@@ -98,7 +101,7 @@ def _bind(host: str, port: int) -> socket.socket:
 
 
 def build_store(args: argparse.Namespace) -> Store:
-    store = Store(args.email, args.display_name, PubSub(emulator_host=args.pubsub_emulator_host))
+    store = Store(args.email, args.display_name, PubSub(emulator_host=args.pubsub_emulator_host), history_limit=args.history_limit)
     if args.seed:
         seed.load_file(store, args.seed)
     for spec in args.push:

@@ -136,6 +136,29 @@ class Query:
     def matches(self, message: Message) -> bool:
         return self._pred(message)
 
+    def required_labels(self) -> set[str] | None:
+        """If the query is only positive label terms (``is:unread in:inbox label:work``),
+        the label ids it requires, so the caller can use the label index instead of scanning."""
+        wanted: set[str] = set()
+        for tok in self._tokens:
+            if not isinstance(tok, tuple) or tok[0] != "OP":
+                return None
+            op, value = tok[1], tok[2].strip().lower()
+            if op == "is" and value in ("unread", "starred", "important"):
+                wanted.add(value.upper())
+            elif op == "in" and value in _IN:
+                wanted.add(_IN[value])
+            elif op == "category" and value in _CATEGORIES:
+                wanted.add(_CATEGORIES[value])
+            elif op == "label":
+                ids = self._label_ids(value)
+                if len(ids) != 1:
+                    return None
+                wanted |= ids
+            else:
+                return None
+        return wanted or None
+
     # --- recursive descent -------------------------------------------------
 
     def _peek(self):

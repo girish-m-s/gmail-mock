@@ -5,33 +5,67 @@ from __future__ import annotations
 import base64
 import copy
 from typing import Any
+from urllib.parse import parse_qsl
 
+import anyio
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__, mime, seed
-from .dispatch import Dispatcher, RawRequest, RawResponse
+from .dispatch import Dispatcher, RawRequest
 from .errors import ApiError
 from .handlers import REGISTRY
 from .store import Store
 from .util import now_ms
 
-HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+FASTAPI_PREFIXES = ("/_mock", "/v1/projects/", "/discovery/", "/$discovery")
+LARGE_BODY = 1_000_000
 
 
-def _to_response(raw: RawResponse) -> Response:
-    return Response(raw.body, status_code=raw.status, media_type=raw.content_type, headers=raw.headers)
+class GoogleApiMiddleware:
+    """Serve Google API paths straight from the dispatcher, bypassing FastAPI routing.
 
+    Only the control API, the Pub/Sub subset and discovery documents go through
+    FastAPI. Requests with large bodies run in a worker thread so decoding them
+    does not stall the event loop; at most two of those run at a time.
+    """
 
-async def _raw_request(request: Request) -> RawRequest:
-    return RawRequest(
-        method=request.method,
-        path=request.scope.get("raw_path", request.url.path.encode()).decode("latin-1").split("?", 1)[0],
-        query=list(request.query_params.multi_items()),
-        headers={k.lower(): v for k, v in request.headers.items()},
-        body=await request.body(),
-    )
+    def __init__(self, app, dispatcher: Dispatcher, large_body_concurrency: int = 2) -> None:
+        self.app = app
+        self.dispatcher = dispatcher
+        # Large uploads briefly need ~4x their size in memory; bound how many decode at once.
+        self.large_limiter = anyio.CapacityLimiter(large_body_concurrency)
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] != "http" or path.startswith(FASTAPI_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        chunks, more = [], True
+        while more:
+            message = await receive()
+            chunks.append(message.get("body", b""))
+            more = message.get("more_body", False)
+        body = b"".join(chunks)
+        raw_path = (scope.get("raw_path") or path.encode()).decode("latin-1").split("?", 1)[0]
+        req = RawRequest(
+            method=scope["method"],
+            path=raw_path,
+            query=parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True),
+            headers={k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]},
+            body=body,
+        )
+        is_batch = scope["method"] == "POST" and (raw_path == "/batch" or raw_path.startswith("/batch/"))
+        handle = self.dispatcher.handle_batch if is_batch else self.dispatcher.handle
+        if len(body) > LARGE_BODY:
+            resp = await anyio.to_thread.run_sync(handle, req, limiter=self.large_limiter)
+        else:
+            resp = handle(req)
+        headers = [(b"content-type", resp.content_type.encode()), (b"content-length", str(len(resp.body)).encode())]
+        headers += [(k.lower().encode(), v.encode()) for k, v in resp.headers.items()]
+        await send({"type": "http.response.start", "status": resp.status, "headers": headers})
+        await send({"type": "http.response.body", "body": resp.body})
 
 
 def _api_error(err: ApiError) -> JSONResponse:
@@ -199,7 +233,7 @@ def create_app(store: Store | None = None, *, require_auth: bool = True) -> Fast
     @control.get("/pubsub/deliveries")
     def deliveries():
         store.pubsub.wait_idle()
-        return {"deliveries": store.pubsub.deliveries}
+        return {"deliveries": list(store.pubsub.deliveries)}
 
     @control.post("/pubsub/subscriptions", status_code=201)
     def add_subscription(sub: SubscriptionIn):
@@ -290,17 +324,8 @@ def create_app(store: Store | None = None, *, require_auth: bool = True) -> Fast
             raise HTTPException(404, "Unknown API")
         return _discovery(api, request)
 
-    # --- batch + catch-all Google API surface -------------------------------------------
-
-    @app.post("/batch", include_in_schema=False)
-    @app.post("/batch/{api}/{version}", include_in_schema=False)
-    async def batch(request: Request):
-        return _to_response(dispatcher.handle_batch(await _raw_request(request)))
-
-    @app.api_route("/{full_path:path}", methods=HTTP_METHODS, include_in_schema=False)
-    async def google_api(request: Request):
-        return _to_response(dispatcher.handle(await _raw_request(request)))
-
+    # Everything else is the Google API surface, served by GoogleApiMiddleware (below).
+    app.add_middleware(GoogleApiMiddleware, dispatcher=dispatcher)
     return app
 
 

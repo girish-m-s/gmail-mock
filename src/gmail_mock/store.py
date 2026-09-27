@@ -7,11 +7,12 @@ watched, publishes a Gmail push notification to the configured Pub/Sub topic.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from email.utils import formataddr, formatdate, make_msgid
 from functools import cached_property
 
@@ -62,6 +63,8 @@ HISTORY_TYPES = {
     "labelRemoved": "labelsRemoved",
 }
 WATCH_TTL_MS = 7 * 24 * 3600 * 1000
+# Parsed forms of messages larger than this are rebuilt on demand instead of cached.
+LARGE_MESSAGE = 1_000_000
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 
 
@@ -83,13 +86,30 @@ class Message:
     def size_estimate(self) -> int:
         return len(self.raw)
 
-    @cached_property
+    @property
     def parsed(self):
-        return mime.parse(self.raw)
+        cached = self.__dict__.get("_parsed")
+        if cached is not None:
+            return cached
+        parsed = mime.parse(self.raw)
+        if len(self.raw) <= LARGE_MESSAGE:
+            self.__dict__["_parsed"] = parsed
+        return parsed
 
     @cached_property
+    def headers(self):
+        """Header-only parse: cheap even for huge messages."""
+        return mime.parse_headers(self.raw)
+
+    @property
     def _payload(self) -> tuple[dict, dict[str, bytes]]:
-        return mime.build_payload(self.parsed, self.id)
+        cached = self.__dict__.get("_payload_cache")
+        if cached is not None:
+            return cached
+        payload = mime.build_payload(self.parsed, self.id)
+        if len(self.raw) <= LARGE_MESSAGE:
+            self.__dict__["_payload_cache"] = payload
+        return payload
 
     @property
     def attachments(self) -> dict[str, bytes]:
@@ -101,7 +121,7 @@ class Message:
 
     @cached_property
     def rfc822_id(self) -> str:
-        return mime.header(self.parsed, "Message-ID").strip().strip("<>").lower()
+        return mime.header(self.headers, "Message-ID").strip().strip("<>").lower()
 
     def search_fields(self) -> dict:
         return self._search_fields
@@ -121,7 +141,7 @@ class Message:
             "filenames": mime.filenames(p),
             "body": mime.text_content(p).lower(),
         }
-        fields["has_attachment"] = bool(self.attachments)
+        fields["has_attachment"] = any(mime.is_attachment(part) for part in p.walk() if not part.is_multipart())
         fields["all"] = " ".join(
             [fields["subject"], fields["body"], fields["from"], fields["to"], fields["cc"], " ".join(fields["filenames"]).lower()]
         )
@@ -171,6 +191,12 @@ class Mailbox:
         self.messages: dict[str, Message] = {}
         self.threads: dict[str, list[str]] = {}
         self._by_rfc822: dict[str, str] = {}
+        # Indexes: (internalDate, id) in sorted order, and label id -> message ids.
+        self._order: list[tuple[int, str]] = []
+        self._by_label: defaultdict[str, set[str]] = defaultdict(set)
+        # label id -> thread id -> number of messages in that thread carrying the label
+        self._label_threads: defaultdict[str, dict[str, int]] = defaultdict(dict)
+        self._draft_by_message: dict[str, str] = {}
         self.labels: dict[str, dict] = {lid: {"id": lid, "name": lid, "type": "system", **extra} for lid, extra in SYSTEM_LABELS.items()}
         self.drafts: dict[str, str] = {}
         self.history: list[dict] = []
@@ -228,7 +254,11 @@ class Mailbox:
         return self.messages[mid]
 
     def draft_id_for(self, message_id: str) -> str | None:
-        return next((d for d, m in self.drafts.items() if m == message_id), None)
+        return self._draft_by_message.get(message_id)
+
+    def _set_draft(self, draft_id: str, message_id: str) -> None:
+        self.drafts[draft_id] = message_id
+        self._draft_by_message[message_id] = draft_id
 
     @property
     def primary_send_as(self) -> dict:
@@ -250,6 +280,12 @@ class Mailbox:
         msg.history_id = hid
         touched = set(msg.label_ids) | set(labels or [])
         self.history.append({"id": hid, "type": kind, "labels": touched, "record": record})
+        limit = self.store.history_limit
+        if limit and len(self.history) > limit:
+            # Like Gmail, old history expires; startHistoryId values before it get a 404.
+            cut = len(self.history) - int(limit * 0.9)
+            self.min_history_id = self.history[cut - 1]["id"]
+            del self.history[:cut]
         self._notify(touched, hid)
 
     def _notify(self, labels: set[str], history_id: int) -> None:
@@ -279,9 +315,8 @@ class Mailbox:
             raise not_found()
         kinds = {HISTORY_TYPES[t] for t in types} if types else None
         out = []
-        for entry in self.history:
-            if entry["id"] <= start:
-                continue
+        first = bisect.bisect_right(self.history, start, key=lambda e: e["id"])
+        for entry in self.history[first:]:
             if kinds and entry["type"] not in kinds:
                 continue
             if label_id and label_id not in entry["labels"]:
@@ -296,18 +331,32 @@ class Mailbox:
             if lid not in self.labels or (lid == "DRAFT" and not allow_draft):
                 raise bad_request(f"Invalid label: {lid}")
 
+    def _index_label(self, msg: Message, label_id: str) -> None:
+        self._by_label[label_id].add(msg.id)
+        threads = self._label_threads[label_id]
+        threads[msg.thread_id] = threads.get(msg.thread_id, 0) + 1
+
+    def _unindex_label(self, msg: Message, label_id: str) -> None:
+        self._by_label[label_id].discard(msg.id)
+        threads = self._label_threads[label_id]
+        remaining = threads.get(msg.thread_id, 0) - 1
+        if remaining > 0:
+            threads[msg.thread_id] = remaining
+        else:
+            threads.pop(msg.thread_id, None)
+
     def label_resource(self, label_id: str, counts: bool = True) -> dict:
         label = self.labels.get(label_id)
         if label is None:
             raise not_found()
         out = dict(label)
         if counts:
-            msgs = [m for m in self.messages.values() if label_id in m.label_ids]
-            unread = [m for m in msgs if "UNREAD" in m.label_ids]
-            out["messagesTotal"] = len(msgs)
+            ids = self._by_label.get(label_id, set())
+            unread = ids & self._by_label.get("UNREAD", set())
+            out["messagesTotal"] = len(ids)
             out["messagesUnread"] = len(unread)
-            out["threadsTotal"] = len({m.thread_id for m in msgs})
-            out["threadsUnread"] = len({m.thread_id for m in unread})
+            out["threadsTotal"] = len(self._label_threads.get(label_id, {}))
+            out["threadsUnread"] = len({self.messages[m].thread_id for m in unread})
         return out
 
     def _validate_label_body(self, body: dict, current_id: str | None = None) -> None:
@@ -366,29 +415,30 @@ class Mailbox:
             raise not_found()
         if label["type"] == "system":
             raise bad_request("Invalid delete request")
-        for msg in list(self.messages.values()):
-            if label_id in msg.label_ids:
-                msg.label_ids.remove(label_id)
-                self._record(msg, "labelsRemoved", [label_id])
+        self._label_threads.pop(label_id, None)
+        for mid in sorted(self._by_label.pop(label_id, set())):
+            msg = self.messages[mid]
+            msg.label_ids.remove(label_id)
+            self._record(msg, "labelsRemoved", [label_id])
         del self.labels[label_id]
 
     # --- messages ----------------------------------------------------------------
 
-    def _thread_for(self, parsed, thread_id: str | None) -> str | None:
+    def _thread_for(self, headers, thread_id: str | None) -> str | None:
         """Pick an existing thread the way Gmail does: explicit threadId + matching subject,
         or References/In-Reply-To pointing at a message with the same subject."""
-        subject = mime.normalize_subject(mime.header(parsed, "Subject"))
+        subject = mime.normalize_subject(mime.header(headers, "Subject"))
         if thread_id and thread_id in self.threads:
             first = self.thread(thread_id)[0]
-            if mime.normalize_subject(mime.header(first.parsed, "Subject")) == subject:
+            if mime.normalize_subject(mime.header(first.headers, "Subject")) == subject:
                 return thread_id
             return None
-        refs = re.findall(r"<([^>]+)>", mime.header(parsed, "In-Reply-To") + " " + mime.header(parsed, "References"))
+        refs = re.findall(r"<([^>]+)>", mime.header(headers, "In-Reply-To") + " " + mime.header(headers, "References"))
         for ref in reversed(refs):
             mid = self._by_rfc822.get(ref.lower())
             if mid and mid in self.messages:
                 candidate = self.messages[mid]
-                if mime.normalize_subject(mime.header(candidate.parsed, "Subject")) == subject:
+                if mime.normalize_subject(mime.header(candidate.headers, "Subject")) == subject:
                     return candidate.thread_id
         return None
 
@@ -403,14 +453,17 @@ class Mailbox:
     ) -> Message:
         if thread_id and thread_must_exist and thread_id not in self.threads:
             raise not_found()
-        parsed = mime.parse(raw)
-        resolved = self._thread_for(parsed, thread_id)
         mid = self.store.ids.message()
+        msg = Message(mid, "", raw, label_ids, internal_date or now_ms())
+        resolved = self._thread_for(msg.headers, thread_id)
         if resolved is None:
             resolved = thread_id if (thread_id and thread_id not in self.threads) else mid
-        msg = Message(mid, resolved, raw, label_ids, internal_date or now_ms())
+        msg.thread_id = resolved
         self.messages[mid] = msg
         self.threads.setdefault(resolved, []).append(mid)
+        bisect.insort(self._order, (msg.internal_date, mid))
+        for lid in msg.label_ids:
+            self._index_label(msg, lid)
         if msg.rfc822_id:
             self._by_rfc822[msg.rfc822_id] = mid
         self._record(msg, "messagesAdded")
@@ -418,12 +471,18 @@ class Mailbox:
 
     def delete_message(self, msg: Message) -> None:
         self.messages.pop(msg.id, None)
+        key = (msg.internal_date, msg.id)
+        idx = bisect.bisect_left(self._order, key)
+        if idx < len(self._order) and self._order[idx] == key:
+            del self._order[idx]
+        for lid in msg.label_ids:
+            self._unindex_label(msg, lid)
         ids = self.threads.get(msg.thread_id, [])
         if msg.id in ids:
             ids.remove(msg.id)
         if not ids:
             self.threads.pop(msg.thread_id, None)
-        draft = self.draft_id_for(msg.id)
+        draft = self._draft_by_message.pop(msg.id, None)
         if draft:
             del self.drafts[draft]
         self._record(msg, "messagesDeleted")
@@ -434,9 +493,13 @@ class Mailbox:
         removed = [lid for lid in _dedupe(remove) if lid in msg.label_ids and lid not in add]
         if added:
             msg.label_ids.extend(added)
+            for lid in added:
+                self._index_label(msg, lid)
             self._record(msg, "labelsAdded", added)
         if removed:
             msg.label_ids = [lid for lid in msg.label_ids if lid not in removed]
+            for lid in removed:
+                self._unindex_label(msg, lid)
             self._record(msg, "labelsRemoved", removed)
         return msg
 
@@ -453,55 +516,95 @@ class Mailbox:
         msg.labels_before_trash = None
         return self.modify(msg, restore, ["TRASH"])
 
+    def _scope(self, query: Query | None, label_ids: list[str] | None, include_spam_trash: bool) -> tuple[set[str] | None, set[str]]:
+        """Candidate ids (None = all) from the label index, and ids hidden as spam/trash."""
+        include = include_spam_trash or (query is not None and query.includes_spam_trash) or bool({"SPAM", "TRASH"} & set(label_ids or []))
+        excluded = set() if include else (self._by_label.get("SPAM", set()) | self._by_label.get("TRASH", set()))
+        candidates = None
+        if label_ids:
+            sets = sorted((self._by_label.get(lid, set()) for lid in label_ids), key=len)
+            candidates = set(sets[0]).intersection(*sets[1:])
+        return candidates, excluded
+
     def search(self, q: str | None, label_ids: list[str] | None, include_spam_trash: bool, messages=None) -> list[Message]:
-        query = Query(q, self)
-        include = include_spam_trash or query.includes_spam_trash or bool({"SPAM", "TRASH"} & set(label_ids or []))
-        pool = self.messages.values() if messages is None else messages
+        """Matching messages, newest first."""
+        query = Query(q, self) if q else None
+        if query is not None and (required := query.required_labels()) is not None:
+            # Label-only query: answer from the label index instead of evaluating every message.
+            label_ids = list(set(label_ids or []) | required)
+            include_spam_trash = include_spam_trash or query.includes_spam_trash
+            query = None
+        candidates, excluded = self._scope(query, label_ids, include_spam_trash)
+        if messages is not None:
+            pool_ids = {m.id for m in messages}
+            candidates = pool_ids if candidates is None else candidates & pool_ids
         out = []
-        for msg in pool:
-            if not include and {"SPAM", "TRASH"} & set(msg.label_ids):
+        for _, mid in reversed(self._order):
+            if (candidates is not None and mid not in candidates) or mid in excluded:
                 continue
-            if label_ids and not set(label_ids) <= set(msg.label_ids):
-                continue
-            if query.matches(msg):
+            msg = self.messages[mid]
+            if query is None or query.matches(msg):
                 out.append(msg)
-        out.sort(key=lambda m: (m.internal_date, m.id), reverse=True)
         return out
+
+    def search_page(
+        self, q: str | None, label_ids: list[str] | None, include_spam_trash: bool, offset: int, size: int
+    ) -> tuple[list[Message], int]:
+        """One page of results plus the total count, without scanning everything when there is no q."""
+        query = Query(q, self) if q else None
+        if query is not None:
+            required = query.required_labels()
+            if required is None:
+                found = self.search(q, label_ids, include_spam_trash)
+                return found[offset : offset + size], len(found)
+            label_ids = list(set(label_ids or []) | required)
+            include_spam_trash = include_spam_trash or query.includes_spam_trash
+        candidates, excluded = self._scope(None, label_ids, include_spam_trash)
+        total = len(self.messages) - len(excluded) if candidates is None else len(candidates - excluded)
+        page, skipped = [], 0
+        for _, mid in reversed(self._order):
+            if (candidates is not None and mid not in candidates) or mid in excluded:
+                continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            page.append(self.messages[mid])
+            if len(page) >= size:
+                break
+        return page, total
 
     # --- sending & receiving -------------------------------------------------------
 
     def _prepare_outgoing(self, raw: bytes) -> tuple[bytes, list[tuple[str, str]]]:
-        parsed = mime.parse(raw)
-        changed = False
-        allowed = {e for e, s in self.send_as.items() if s.get("isPrimary") or s.get("verificationStatus") == "accepted"}
-        from_addrs = mime.addresses(parsed, "From")
-        if not from_addrs or from_addrs[0][1] not in allowed:
-            default = next((s for s in self.send_as.values() if s.get("isDefault")), self.primary_send_as)
-            del parsed["From"]
-            parsed["From"] = formataddr((default.get("displayName") or "", default["sendAsEmail"]))
-            changed = True
-        if not parsed.get("Date"):
-            parsed["Date"] = formatdate(usegmt=True)
-            changed = True
-        if not parsed.get("Message-ID"):
-            parsed["Message-ID"] = make_msgid(domain="mail.gmail.com")
-            changed = True
-        recipients = mime.addresses(parsed, "To", "Cc", "Bcc")
+        """Fix up From/Date/Message-ID by editing only the header block (bodies can be huge)."""
+        headers = mime.parse_headers(raw)
+        recipients = mime.addresses(headers, "To", "Cc", "Bcc")
         if not recipients:
             raise bad_request("Recipient address required")
-        return (mime.serialize(parsed) if changed else raw), recipients
+        allowed = {e for e, s in self.send_as.items() if s.get("isPrimary") or s.get("verificationStatus") == "accepted"}
+        from_addrs = mime.addresses(headers, "From")
+        remove, add = [], []
+        if not from_addrs or from_addrs[0][1] not in allowed:
+            default = next((s for s in self.send_as.values() if s.get("isDefault")), self.primary_send_as)
+            remove.append("From")
+            add.append(("From", formataddr((default.get("displayName") or "", default["sendAsEmail"]), charset="utf-8")))
+        if not headers.get("Date"):
+            add.append(("Date", formatdate(usegmt=True)))
+        if not headers.get("Message-ID"):
+            add.append(("Message-ID", make_msgid(domain="mail.gmail.com")))
+        if remove or add:
+            raw = mime.edit_headers(raw, remove=remove, add=add)
+        return raw, recipients
 
     def send(self, raw: bytes, thread_id: str | None = None, *, thread_must_exist: bool = True) -> Message:
         raw, recipients = self._prepare_outgoing(raw)
         emails = _dedupe(addr for _, addr in recipients)
         labels = ["SENT"] + (["INBOX"] if self.email in emails else [])
         msg = self.insert(raw, labels, thread_id=thread_id, thread_must_exist=thread_must_exist)
-        delivered = mime.parse(raw)
-        del delivered["Bcc"]
-        delivered_raw = mime.serialize(delivered)
-        for addr in emails:
-            box = self.store.mailboxes.get(addr)
-            if box is not None and box is not self:
+        local = [self.store.mailboxes[a] for a in emails if a in self.store.mailboxes and self.store.mailboxes[a] is not self]
+        if local:
+            delivered_raw = mime.edit_headers(raw, remove=["Bcc"])
+            for box in local:
                 box.receive(delivered_raw)
         self.remember_correspondents(recipients)
         return msg
@@ -530,7 +633,7 @@ class Mailbox:
     def create_draft(self, raw: bytes, thread_id: str | None = None) -> tuple[str, Message]:
         msg = self.insert(raw, ["DRAFT"], thread_id=thread_id)
         draft_id = self.store.ids.draft()
-        self.drafts[draft_id] = msg.id
+        self._set_draft(draft_id, msg.id)
         return draft_id, msg
 
     def update_draft(self, draft_id: str, raw: bytes, thread_id: str | None = None) -> Message:
@@ -538,7 +641,7 @@ class Mailbox:
         keep_thread = thread_id or old.thread_id
         self.delete_message(old)
         msg = self.insert(raw, ["DRAFT"], thread_id=keep_thread, thread_must_exist=False)
-        self.drafts[draft_id] = msg.id
+        self._set_draft(draft_id, msg.id)
         return msg
 
     def send_draft(self, draft_id: str, raw: bytes | None = None, thread_id: str | None = None) -> Message:
@@ -591,8 +694,10 @@ class Store:
         default_name: str | None = "Mock User",
         pubsub: PubSub | None = None,
         request_log_size: int = 500,
+        history_limit: int = 100_000,
     ) -> None:
         self.lock = threading.RLock()
+        self.history_limit = history_limit
         self.ids = IdGenerator()
         self.pubsub = pubsub or PubSub()
         self.default_email = default_email.lower()

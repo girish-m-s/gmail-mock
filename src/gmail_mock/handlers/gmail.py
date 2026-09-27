@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .. import mime
 from ..errors import bad_request, not_found
-from ..util import compact, now_ms, paginate
+from ..util import compact, decode_page_token, encode_page_token, now_ms, paginate
 from . import Ctx, handler
 
 MAX_PAGE = 500
@@ -59,9 +59,10 @@ def list_history(ctx: Ctx):
 
 @handler("gmail.users.messages.list")
 def list_messages(ctx: Ctx):
-    found = ctx.mailbox.search(ctx.q("q"), ctx.q("labelIds"), ctx.q("includeSpamTrash", False))
-    page, token = paginate(found, ctx.q("pageToken"), _page_size(ctx))
-    return compact({"messages": [m.ref() for m in page], "nextPageToken": token, "resultSizeEstimate": len(found)})
+    offset, size = decode_page_token(ctx.q("pageToken")), _page_size(ctx)
+    page, total = ctx.mailbox.search_page(ctx.q("q"), ctx.q("labelIds"), ctx.q("includeSpamTrash", False), offset, size)
+    token = encode_page_token(offset + size) if offset + size < total else None
+    return compact({"messages": [m.ref() for m in page], "nextPageToken": token, "resultSizeEstimate": total})
 
 
 @handler("gmail.users.messages.get")

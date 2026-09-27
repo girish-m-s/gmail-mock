@@ -8,6 +8,7 @@ real proto-JSON front end does.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .errors import ApiError
@@ -66,6 +67,20 @@ def validate_body(api: Api, ref: str, body: Any) -> Any:
     return _validate(api, {"$ref": ref}, body, "")
 
 
+_B64 = re.compile(r"[A-Za-z0-9+/_\-\s]*={0,2}\s*")
+
+
+def _looks_base64(value: str) -> bool:
+    """Structural base64 check without decoding (payloads can be tens of MB)."""
+    if len(value) < 4096:
+        try:
+            b64decode_any(value)
+            return True
+        except ValueError:
+            return False
+    return _B64.fullmatch(value) is not None and len(re.sub(r"[\s=]", "", value)) % 4 != 1
+
+
 def _at(loc: str) -> str:
     return f" at '{loc}'" if loc else ""
 
@@ -112,9 +127,7 @@ def _validate(api: Api, schema: dict, value: Any, loc: str) -> Any:
         if not isinstance(value, str):
             raise ApiError(400, f"Invalid value at '{loc}' (TYPE_STRING), {value!r}")
         if fmt == "byte":
-            try:
-                b64decode_any(value)
-            except ValueError:
+            if not _looks_base64(value):
                 raise ApiError(400, f"Invalid value at '{loc}' (TYPE_BYTES), Base64 decoding failed for \"{value[:40]}\"") from None
         enum = schema.get("enum")
         if enum and value not in enum:

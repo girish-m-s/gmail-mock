@@ -1,4 +1,4 @@
-.PHONY: install test lint format run docker update-spec
+.PHONY: install test lint format run docker update-spec stress
 
 install:
 	uv sync
@@ -23,3 +23,6 @@ docker:
 update-spec:
 	./scripts/update_spec.sh
 	uv run pytest -q tests/test_catalog.py
+
+stress:
+	uv run python stress/loadtest.py

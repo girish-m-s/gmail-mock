@@ -172,9 +172,9 @@ def get_smime(ctx: Ctx):
 
 @handler("gmail.users.settings.sendAs.smimeInfo.insert")
 def insert_smime(ctx: Ctx):
+    book = _smime_book(ctx)
     if not (ctx.data.get("pkcs12") or ctx.data.get("pem")):
         raise bad_request("Either pkcs12 or pem is required")
-    book = _smime_book(ctx)
     sid = secrets.token_urlsafe(16)
     info = {
         "id": sid,

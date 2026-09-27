@@ -9,6 +9,7 @@ import re
 from collections.abc import Iterable
 from email import policy
 from email.message import EmailMessage
+from email.parser import BytesHeaderParser
 from email.utils import formatdate, getaddresses, make_msgid, parsedate_to_datetime
 
 from .util import b64url
@@ -18,6 +19,30 @@ SMTP_POLICY = policy.default.clone(linesep="\r\n")
 
 def parse(raw: bytes) -> EmailMessage:
     return email.message_from_bytes(raw, policy=policy.default)  # type: ignore[return-value]
+
+
+def parse_headers(raw: bytes) -> EmailMessage:
+    """Parse only the header block; the body is left unparsed."""
+    head, sep, _ = split_head(raw)
+    return BytesHeaderParser(policy=policy.default).parsebytes(head + sep)  # type: ignore[return-value]
+
+
+def split_head(raw: bytes) -> tuple[bytes, bytes, bytes]:
+    """(header block, blank-line separator, body). Headers-only input yields an empty separator."""
+    m = re.search(rb"\r?\n\r?\n", raw)
+    if not m:
+        return raw, b"", b""
+    return raw[: m.start()], raw[m.start() : m.end()], raw[m.end() :]
+
+
+def edit_headers(raw: bytes, *, remove=(), add=()) -> bytes:
+    """Drop headers by name and prepend new ones, leaving the body bytes untouched."""
+    head, sep, body = split_head(raw)
+    newline = b"\r\n" if b"\r\n" in (sep or head[:2000]) else b"\n"
+    for name in remove:
+        head = re.sub(rb"(?im)^" + re.escape(name.encode()) + rb":[^\n]*\n?(?:[ \t][^\n]*\n?)*", b"", head + newline).rstrip(b"\r\n")
+    added = b"".join(f"{name}: {value}".encode() + newline for name, value in add)
+    return added + head + (sep or newline * 2) + body
 
 
 def serialize(msg: EmailMessage) -> bytes:

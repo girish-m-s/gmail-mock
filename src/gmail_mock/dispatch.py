@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import secrets
@@ -73,8 +72,8 @@ class Dispatcher:
                 ctx = Ctx(self.store, method, auth_email, path_params, query, body, media)
                 fn = REGISTRY.get(method.id)
                 result = fn(ctx) if fn else generate(method.api, method.response_ref, body)
-                result = copy.deepcopy(result)
-            response = self._render(result, query)
+                # Serialise while holding the lock: results may share dicts with live state.
+                response = self._render(result, query)
         except ApiError as err:
             response = RawResponse(err.code, json.dumps(err.to_dict(), indent=2).encode())
         except Exception as exc:  # noqa: BLE001
@@ -169,8 +168,10 @@ class Dispatcher:
             return RawResponse(204, b"")
         if query.get("fields"):
             result = partial.apply(result, partial.parse(query["fields"]))
-        indent = None if query.get("prettyPrint") is False else 2
-        return RawResponse(200, json.dumps(result, indent=indent, ensure_ascii=False).encode())
+        # Compact by default (the C encoder is far faster); prettyPrint=true indents like Google.
+        if query.get("prettyPrint") is True:
+            return RawResponse(200, json.dumps(result, indent=2, ensure_ascii=False).encode())
+        return RawResponse(200, json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode())
 
     def _log(self, req: RawRequest, method_id, body, resp: RawResponse, started: float) -> None:
         self.store.requests.append(
@@ -180,8 +181,19 @@ class Dispatcher:
                 "path": req.path,
                 "methodId": method_id,
                 "query": [list(item) for item in req.query],
-                "body": body,
+                "body": _abbreviate(body),
                 "status": resp.status,
                 "durationMs": round((time.perf_counter() - started) * 1000, 2),
             }
         )
+
+
+def _abbreviate(value, limit: int = 2048):
+    """Keep the request log small: long strings (e.g. base64 ``raw``) become a placeholder."""
+    if isinstance(value, str) and len(value) > limit:
+        return f"<{len(value)} chars>"
+    if isinstance(value, dict):
+        return {k: _abbreviate(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_abbreviate(v, limit) for v in value]
+    return value

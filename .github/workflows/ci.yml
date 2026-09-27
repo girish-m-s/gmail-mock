@@ -25,6 +25,20 @@ jobs:
       - run: uv run ruff format --check src tests examples
       - run: uv run pytest -q
 
+  stress-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run python stress/loadtest.py --quick verify push throughput --duration 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stress-results
+          path: stress/results/
+
   docker:
     runs-on: ubuntu-latest
     steps:

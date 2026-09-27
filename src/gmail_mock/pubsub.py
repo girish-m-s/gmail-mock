@@ -45,18 +45,29 @@ class Subscription:
 
 
 class PubSub:
-    def __init__(self, emulator_host: str | None = None, push_retries: int = 3) -> None:
+    def __init__(
+        self,
+        emulator_host: str | None = None,
+        push_retries: int = 3,
+        push_workers: int = 8,
+        log_size: int = 10_000,
+        max_pending: int = 100_000,
+    ) -> None:
         self.emulator_host = emulator_host
         self.push_retries = push_retries
+        self.max_pending = max_pending
         self.topics: set[str] = set()
         self.subscriptions: dict[str, Subscription] = {}
-        self.published: list[dict] = []
-        self.deliveries: list[dict] = []
+        # Inspection logs are bounded so long-running mocks don't grow without limit.
+        self.published: deque = deque(maxlen=log_size)
+        self.deliveries: deque = deque(maxlen=log_size)
         self._lock = threading.RLock()
         self._counter = 0
         self._queue: queue.Queue = queue.Queue()
-        self._worker = threading.Thread(target=self._run, name="pubsub-push", daemon=True)
-        self._worker.start()
+        # Several workers, like Pub/Sub's concurrent push delivery (ordering is not guaranteed).
+        # They start on the first push so idle PubSub instances cost no threads.
+        self._push_workers = push_workers
+        self._workers: list[threading.Thread] = []
 
     # --- admin ---------------------------------------------------------------
 
@@ -120,11 +131,13 @@ class PubSub:
                 if sub.topic != topic:
                     continue
                 if sub.push_endpoint:
-                    self._queue.put((sub, message))
+                    self._enqueue((sub, message))
                 else:
                     sub.pending.append(message)
+                    while len(sub.pending) > self.max_pending:
+                        sub.pending.popleft()
         if self.emulator_host:
-            self._queue.put((None, (topic, data, attributes or {})))
+            self._enqueue((None, (topic, data, attributes or {})))
         return message_id
 
     def pull(self, name: str, max_messages: int) -> list[dict]:
@@ -152,10 +165,31 @@ class PubSub:
 
     # --- delivery worker ----------------------------------------------------------
 
+    def _enqueue(self, item) -> None:
+        if not self._workers:
+            with self._lock:
+                while len(self._workers) < self._push_workers:
+                    worker = threading.Thread(target=self._run, name=f"pubsub-push-{len(self._workers)}", daemon=True)
+                    self._workers.append(worker)
+                    worker.start()
+        self._queue.put(item)
+
+    def close(self) -> None:
+        """Stop the delivery workers (after queued deliveries finish)."""
+        for _ in self._workers:
+            self._queue.put(None)
+        for worker in self._workers:
+            worker.join(timeout=5)
+        self._workers.clear()
+
     def _run(self) -> None:
         with httpx.Client(timeout=5.0) as client:
             while True:
-                sub, payload = self._queue.get()
+                item = self._queue.get()
+                if item is None:
+                    self._queue.task_done()
+                    return
+                sub, payload = item
                 try:
                     if sub is None:
                         self._forward_to_emulator(client, *payload)
