@@ -60,7 +60,7 @@ workers, without a Google account, OAuth, quotas or flaky network calls.
 ## Usage
 
 ```bash
-uv tool install git+https://github.com/<owner>/gmail-mock   # or: pip install git+https://...
+uv tool install git+https://github.com/girish-m-s/gmail-mock   # or: pip install git+https://...
 gmail-mock                                                   # HTTP :12411, HTTPS :12412
 ```
 
@@ -82,7 +82,7 @@ docker build -t gmail-mock .
 docker run --rm -p 12411-12412:12411-12412 gmail-mock --seed examples/seed.json
 ```
 
-Tagged releases publish `ghcr.io/<owner>/gmail-mock` (see `.github/workflows/release.yml`).
+Tagged releases publish `ghcr.io/girish-m-s/gmail-mock` (see `.github/workflows/release.yml`).
 
 ### Sample request
 
