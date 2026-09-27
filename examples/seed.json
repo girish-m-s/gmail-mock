@@ -1,0 +1,70 @@
+{
+  "users": [
+    {
+      "email": "me@example.com",
+      "displayName": "Mock User",
+      "labels": [
+        { "name": "Work", "color": { "textColor": "#ffffff", "backgroundColor": "#16a766" } },
+        { "name": "Receipts" },
+        { "name": "Follow Up" }
+      ],
+      "messages": [
+        {
+          "from": "Priya Raman <priya@acme.example>",
+          "subject": "Q3 planning — draft agenda",
+          "text": "Hi,\n\nSharing the draft agenda for Thursday. Could you add the hiring update?\n\nThanks,\nPriya",
+          "labels": ["INBOX", "UNREAD", "IMPORTANT", "CATEGORY_PERSONAL", "Work"],
+          "date": "2026-09-24T09:15:00Z",
+          "attachments": [{ "filename": "agenda.txt", "mimeType": "text/plain", "content": "1. Roadmap\n2. Budget\n3. Hiring" }]
+        },
+        {
+          "subject": "Re: Q3 planning — draft agenda",
+          "to": ["priya@acme.example"],
+          "text": "Added the hiring update. See you Thursday.",
+          "labels": ["SENT"],
+          "date": "2026-09-24T10:02:00Z",
+          "replyTo": 0
+        },
+        {
+          "from": "Orders <orders@shop.example>",
+          "subject": "Your order #48213 has shipped",
+          "html": "<p>Your order <b>#48213</b> is on its way. Total: $42.10</p>",
+          "labels": ["INBOX", "CATEGORY_UPDATES", "Receipts"],
+          "date": "2026-09-25T16:40:00Z"
+        },
+        {
+          "from": "Weekly Digest <digest@news.example>",
+          "subject": "This week in open source",
+          "text": "Top stories this week...",
+          "labels": ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"],
+          "date": "2026-09-26T07:00:00Z",
+          "headers": { "List-Id": "<digest.news.example>" }
+        },
+        {
+          "from": "Sam Lee <sam@partner.example>",
+          "subject": "Contract signature needed",
+          "text": "Could you sign the contract by Friday?",
+          "labels": ["INBOX", "UNREAD", "STARRED", "CATEGORY_PERSONAL", "Follow Up"],
+          "date": "2026-09-26T11:30:00Z"
+        }
+      ],
+      "drafts": [
+        { "to": ["sam@partner.example"], "subject": "Re: Contract signature needed", "text": "Signed copy attached.", "replyTo": 4 }
+      ],
+      "contacts": [
+        { "name": "Priya Raman", "email": "priya@acme.example", "organization": "Acme" },
+        { "name": "Sam Lee", "email": "sam@partner.example", "phone": "+1 555 0142" }
+      ],
+      "otherContacts": [
+        { "name": "Orders", "email": "orders@shop.example" }
+      ],
+      "filters": [
+        { "criteria": { "from": "digest@news.example" }, "action": { "removeLabelIds": ["INBOX"] } }
+      ]
+    },
+    {
+      "email": "teammate@example.com",
+      "displayName": "Team Mate"
+    }
+  ]
+}
