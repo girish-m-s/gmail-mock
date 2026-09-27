@@ -1,6 +1,6 @@
 """The People API subset used by Gmail connectors (contacts, other contacts, groups).
 
-Composio's "Get contacts", "Get People" and "Search People" tools call these.
+Gmail connectors' contact tools ("Get contacts", "Get People", "Search People") call these.
 Sending mail adds unknown recipients to "Other contacts", as Gmail does.
 """
 

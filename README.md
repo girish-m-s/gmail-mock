@@ -113,7 +113,7 @@ Google's: `/gmail/v1/...`, `/upload/gmail/v1/...`, `/v1/people/...`, `/batch`. T
 
 ## Triggers (push notifications)
 
-Composio's two Gmail triggers are built on this Gmail mechanism, and the mock reproduces it:
+Gmail connectors typically expose two triggers, both built on this Gmail mechanism, and the mock reproduces it:
 
 | Trigger | What fires it | What your code sees |
 | --- | --- | --- |
@@ -165,18 +165,14 @@ See [`examples/seed.json`](examples/seed.json). Each user can have `labels`, `me
 `contacts`, `otherContacts`, `filters` (label names are resolved to ids) and `settings`. Seeding does not create history
 entries, so the history log starts empty after seeding.
 
-## Composio Gmail toolkit coverage
+## Connector tool coverage
 
-[Composio's Gmail toolkit](https://composio.dev/toolkits/gmail) lists 61 tools and 2 triggers. 59 of the tools are
-Gmail or People API operations. The other two, "Create Prompt Post" (Sanity) and "Update User Attributes
-Values", are not Gmail APIs and are not mocked. The mapping lives in
-[`connectors/composio_gmail.json`](connectors/composio_gmail.json), and `tests/test_catalog.py` checks that every
-endpoint listed there is implemented.
+[`connectors/gmail_tools.json`](connectors/gmail_tools.json) maps 59 common Gmail connector tools and 2 triggers to the Google API methods behind them (including the People API for contacts). `tests/test_catalog.py` checks that every listed method is implemented.
 
 <details>
 <summary>Tool → Google API methods</summary>
 
-| Composio tool | Methods |
+| Tool | Methods |
 | --- | --- |
 | Modify email labels | `gmail.users.messages.modify` |
 | Batch delete Gmail messages | `gmail.users.messages.batchDelete` |

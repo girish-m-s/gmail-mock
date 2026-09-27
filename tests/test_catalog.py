@@ -19,10 +19,10 @@ def test_people_methods_are_stateful_except_photos():
     assert {m for m in methods if m not in REGISTRY} == FALLBACK_ONLY
 
 
-def test_composio_tools_map_to_real_endpoints():
-    doc = json.loads((ROOT / "connectors" / "composio_gmail.json").read_text())
+def test_connector_tools_map_to_real_endpoints():
+    doc = json.loads((ROOT / "connectors" / "gmail_tools.json").read_text())
     methods = Catalog().methods
-    assert len(doc["tools"]) + len(doc["excluded"]) == 61
+    assert len(doc["tools"]) == 59
     assert len(doc["triggers"]) == 2
     for tool in doc["tools"] + doc["triggers"]:
         for mid in tool["methods"]:

@@ -1,4 +1,4 @@
-"""The two Composio triggers, done the way Google does it: watch -> Pub/Sub -> history.list."""
+"""The two Gmail triggers (new message received, email sent), done the way Google does it: watch -> Pub/Sub -> history.list."""
 
 import base64
 import json

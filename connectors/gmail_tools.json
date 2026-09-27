@@ -1,7 +1,5 @@
 {
-  "source": "https://composio.dev/toolkits/gmail",
-  "retrieved": "2026-09-26",
-  "note": "Composio lists 61 tools and 2 triggers. Two listed tools are not Gmail APIs and are excluded: 'Create Prompt Post' (Sanity Content Agent) and 'Update User Attributes Values'. Tool names are the titles shown on the page.",
+  "description": "Common Gmail connector tools and triggers, mapped to the Google API methods that implement them. tests/test_catalog.py checks every method listed here is implemented.",
   "tools": [
     {
       "title": "Modify email labels",
@@ -364,13 +362,9 @@
       ]
     }
   ],
-  "excluded": [
-    "Create Prompt Post",
-    "Update User Attributes Values"
-  ],
   "triggers": [
     {
-      "title": "New Gmail Message Received Trigger",
+      "title": "New Gmail Message Received",
       "description": "Triggers when a new message is received in Gmail.",
       "mechanism": "gmail.users.watch -> Pub/Sub notification -> gmail.users.history.list (messagesAdded with INBOX)",
       "methods": [
