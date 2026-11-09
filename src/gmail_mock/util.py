@@ -87,13 +87,23 @@ class IdGenerator:
     def __init__(self) -> None:
         self._counter = itertools.count(1)
         self._lock = threading.Lock()
+        self._message_ids: set[str] = set()
 
     def _next(self) -> int:
         with self._lock:
             return next(self._counter)
 
+    def reserve_message_ids(self, ids) -> None:
+        with self._lock:
+            self._message_ids.update(ids)
+
     def message(self) -> str:
-        return f"{0x1920000000000000 + (self._next() << 12) + secrets.randbelow(4096):016x}"
+        with self._lock:
+            while True:
+                value = f"{0x1920000000000000 + (next(self._counter) << 12) + secrets.randbelow(4096):016x}"
+                if value not in self._message_ids:
+                    self._message_ids.add(value)
+                    return value
 
     def draft(self) -> str:
         return f"r{secrets.randbelow(10**18) + 10**18}"

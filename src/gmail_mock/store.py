@@ -79,6 +79,7 @@ class Message:
         self.raw = raw
         self.label_ids = _dedupe(label_ids)
         self.internal_date = internal_date
+        self.seed_attachment_ids: dict[str, str] | None = None
         self.history_id = 0
         self.labels_before_trash: list[str] | None = None
 
@@ -106,7 +107,7 @@ class Message:
         cached = self.__dict__.get("_payload_cache")
         if cached is not None:
             return cached
-        payload = mime.build_payload(self.parsed, self.id)
+        payload = mime.build_payload(self.parsed, self.id, self.seed_attachment_ids)
         if len(self.raw) <= LARGE_MESSAGE:
             self.__dict__["_payload_cache"] = payload
         return payload
@@ -450,12 +451,26 @@ class Mailbox:
         internal_date: int | None = None,
         thread_id: str | None = None,
         thread_must_exist: bool = True,
+        seed_id: str | None = None,
+        seed_thread_id: str | None = None,
+        seed_attachment_ids: dict[str, str] | None = None,
     ) -> Message:
         if thread_id and thread_must_exist and thread_id not in self.threads:
             raise not_found()
-        mid = self.store.ids.message()
+        if seed_id is not None and seed_id in self.messages:
+            raise bad_request(f"Duplicate seed message id: {seed_id}")
+        self.store.ids.reserve_message_ids(v for v in (seed_id, seed_thread_id) if v is not None)
+        mid = seed_id if seed_id is not None else self.store.ids.message()
         msg = Message(mid, "", raw, label_ids, internal_date or now_ms())
-        resolved = self._thread_for(msg.headers, thread_id)
+        if seed_attachment_ids is not None:
+            if not isinstance(seed_attachment_ids, dict):
+                raise bad_request("attachmentIds must map MIME part IDs to attachment IDs")
+            msg.seed_attachment_ids = dict(seed_attachment_ids)
+            try:
+                _ = msg.attachments  # Validate before inserting into mailbox indexes.
+            except ValueError as exc:
+                raise bad_request(str(exc)) from exc
+        resolved = seed_thread_id if seed_thread_id is not None else self._thread_for(msg.headers, thread_id)
         if resolved is None:
             resolved = thread_id if (thread_id and thread_id not in self.threads) else mid
         msg.thread_id = resolved
@@ -719,6 +734,7 @@ class Store:
     def reset(self) -> None:
         with self.lock:
             self.mailboxes.clear()
+            self.ids = IdGenerator()
             self.faults.clear()
             self.requests.clear()
             self.pubsub.reset()

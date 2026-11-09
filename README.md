@@ -282,3 +282,27 @@ right shape and copies back matching request fields. Today only the two People c
 ## License
 
 MIT
+
+### Captured provider identities (fork extension)
+
+Seed messages accept optional `id` and `threadId` hexadecimal strings. Explicit
+thread membership is authoritative during seeding, including when subjects differ.
+Without these fields, the existing ID generation and MIME threading rules apply.
+Normal send/receive calls still generate IDs and use normal threading rules.
+
+Message IDs must be unique within a mailbox. Duplicate IDs (including existing
+messages and repeated users in one seed request) and malformed IDs return HTTP 400
+before any messages in that batch are inserted. Mailboxes own independent message
+and thread namespaces: the same IDs can appear in two mailboxes without linking
+their contents. Generated IDs skip all reserved message and thread IDs, including
+IDs supplied later in the same seed batch. Reset clears those reservations.
+
+For captured attachment downloads, `attachmentIds` maps MIME `partId` strings to
+provider attachment IDs, for example `"attachmentIds": {"1": "captured-id"}`.
+Keys must identify attachment leaves and resulting IDs must be unique within that
+message. Unspecified attachments retain generated IDs. This also works with `raw`
+MIME fixtures, whose bytes remain unchanged. Invalid attachment mappings reject
+the affected message; seeding is not otherwise a transactional import.
+
+The convenience seeder also preserves a supplied `headers.Message-ID` instead of
+adding a second header. Provider IDs and RFC Message-ID headers are independent.
