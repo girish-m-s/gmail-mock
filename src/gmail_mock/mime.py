@@ -95,13 +95,14 @@ def attachment_id(message_id: str, part_id: str) -> str:
     return "ANGjdJ" + b64url(digest + hashlib.sha256(digest).digest()).rstrip("=")
 
 
-def build_payload(msg: EmailMessage, message_id: str) -> tuple[dict, dict[str, bytes]]:
+def build_payload(msg: EmailMessage, message_id: str, attachment_ids: dict[str, str] | None = None) -> tuple[dict, dict[str, bytes]]:
     """Project a parsed message onto Gmail's MessagePart tree.
 
     Leaf parts with a filename (or disposition attachment) get ``body.attachmentId``;
     other leaves carry their content inline in ``body.data``.
     """
     attachments: dict[str, bytes] = {}
+    remaining = dict(attachment_ids or {})
 
     def walk(part: EmailMessage, part_id: str) -> dict:
         out = {
@@ -116,7 +117,9 @@ def build_payload(msg: EmailMessage, message_id: str) -> tuple[dict, dict[str, b
             return out
         data = _leaf_bytes(part)
         if is_attachment(part):
-            aid = attachment_id(message_id, part_id)
+            aid = remaining.pop(part_id, attachment_id(message_id, part_id))
+            if not isinstance(aid, str) or not aid or aid in attachments:
+                raise ValueError("Attachment IDs must be non-empty strings unique within a message")
             attachments[aid] = data
             out["body"] = {"attachmentId": aid, "size": len(data)}
         elif data:
@@ -125,7 +128,10 @@ def build_payload(msg: EmailMessage, message_id: str) -> tuple[dict, dict[str, b
             out["body"] = {"size": 0}
         return out
 
-    return walk(msg, ""), attachments
+    payload = walk(msg, "")
+    if remaining:
+        raise ValueError("attachmentIds contains unknown or non-attachment MIME part IDs")
+    return payload, attachments
 
 
 def _part_text(part: EmailMessage) -> str:

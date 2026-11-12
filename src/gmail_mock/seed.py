@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
 from . import mime
+from .errors import bad_request
 from .handlers.people import create_contact, new_other_contact
 from .store import RECEIVED_LABELS, Mailbox, Store
 from .util import now_ms
@@ -71,7 +73,8 @@ def compose_message(box: Mailbox, spec: dict, parent=None) -> bytes:
         in_reply_to=in_reply_to,
         references=references,
         date=_date_ms(spec.get("date")),
-        extra_headers=spec.get("headers"),
+        message_id=next((v for k, v in (spec.get("headers") or {}).items() if k.lower() == "message-id"), None),
+        extra_headers={k: v for k, v in (spec.get("headers") or {}).items() if k.lower() != "message-id"},
     )
 
 
@@ -89,7 +92,16 @@ def load_user(store: Store, spec: dict) -> Mailbox:
         raw = compose_message(box, item, parent)
         labels = resolve_labels(box, item.get("labels", RECEIVED_LABELS if item.get("from") else ["SENT"]))
         date = _date_ms(item.get("date")) or mime.date_ms(mime.parse(raw)) or now_ms()
-        created.append(box.insert(raw, labels, internal_date=date))
+        created.append(
+            box.insert(
+                raw,
+                labels,
+                internal_date=date,
+                seed_id=item.get("id"),
+                seed_thread_id=item.get("threadId"),
+                seed_attachment_ids=item.get("attachmentIds"),
+            )
+        )
     for item in spec.get("drafts", []):
         parent = created[item["replyTo"]] if isinstance(item.get("replyTo"), int) else None
         box.create_draft(compose_message(box, item, parent), parent.thread_id if parent else None)
@@ -130,6 +142,24 @@ def load_user(store: Store, spec: dict) -> Mailbox:
 
 def load(store: Store, data: dict) -> list[Mailbox]:
     with store.lock:
+        # Validate the whole batch before inserting, and reserve future fixture IDs
+        # before any automatically generated message can take one.
+        seen = {email: set(box.messages) for email, box in store.mailboxes.items()}
+        reserved = set()
+        for user in data.get("users", []):
+            ids = seen.setdefault(user["email"].lower(), set())
+            for item in user.get("messages", []):
+                for key in ("id", "threadId"):
+                    if key in item:
+                        value = item[key]
+                        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]+", value):
+                            raise bad_request(f"Seed {key} must be a non-empty hexadecimal string")
+                        reserved.add(value)
+                if "id" in item:
+                    if item["id"] in ids:
+                        raise bad_request(f"Duplicate seed message id: {item['id']}")
+                    ids.add(item["id"])
+        store.ids.reserve_message_ids(reserved)
         return [load_user(store, spec) for spec in data.get("users", [])]
 
 
